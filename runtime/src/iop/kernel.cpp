@@ -587,16 +587,32 @@ void run(std::uint64_t ee_cycles) {
     g_ee_remainder += ee_cycles;
     g_target += g_ee_remainder / kClockDivider;
     g_ee_remainder %= kClockDivider;
+    std::vector<Event> deferred;
     while (g_now < g_target) {
+        deferred.clear();
         const Thread *running = current();
-        // A thread inside CpuSuspendIntr cannot be preempted: interrupt-side events wait for CpuResumeIntr.
-        if (!g_suspended || !running || running->status != kRun) {
-            while (!g_events.empty() && g_events.top().at <= g_now) {
-                const Event event = g_events.top();
+        // A thread inside CpuSuspendIntr cannot be preempted: interrupt delivery and thread
+        // switching wait for CpuResumeIntr. The SPU2 and the DMA controller, however, keep
+        // running: a game that enters a critical section to wait for a voice transfer or a
+        // DMA to finish (Dynasty Warriors 4 does, polling a voice's NAX) must not deadlock.
+        const bool deliverable = !g_suspended || !running || running->status != kRun;
+        while (!g_events.empty() && g_events.top().at <= g_now) {
+            const Event due = g_events.top();
+            const bool hardware = due.job.kind == kJobSpuTick || due.job.kind == kJobDmaDone;
+            if (!deliverable && !hardware) {
+                // Software events wait for CpuResumeIntr; hardware that is independent of interrupts
+                // must not be stuck behind them, or a guest polling SPU2/DMA inside a critical section
+                // deadlocks (Dynasty Warriors 4 waits like that for a voice's NAX).
+                deferred.push_back(due);
                 g_events.pop();
-                if (event.job.kind) g_jobs[event.job.kind](event.job);
-                else event.action();
+                continue;
             }
+            g_events.pop();
+            if (due.job.kind) g_jobs[due.job.kind](due.job);
+            else due.action();
+        }
+        for (Event &e : deferred) g_events.push(std::move(e));
+        if (deliverable) {
             deliver_interrupts();
             if (g_switch) do_switch();
         }
